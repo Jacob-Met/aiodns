@@ -88,17 +88,17 @@ class _DefaultChannelPool:
         self._idle_ref: weakref.ReferenceType[asyncio.TimerHandle] | None = (
             None
         )
+        self._idle_deadline: float | None = None
+        self._idle_generation = 0
         self._closed = False
         # The pool must not keep an event loop alive after it is closed.
         self._finalizer = weakref.finalize(loop, self._close_channel)
 
     def acquire(self) -> None:
-        if self._idle_ref is not None:
-            idle = self._idle_ref()
-            if idle is not None:
-                idle.cancel()
-            self._idle_ref = None
+        # Keep one timer armed through resolver churn instead of creating and
+        # cancelling a TimerHandle and weakref finalizer for every client.
         self.references += 1
+        self._idle_deadline = None
 
     def release(self) -> None:
         self.references -= 1
@@ -108,10 +108,45 @@ class _DefaultChannelPool:
         if loop is None or loop.is_closed():
             self.expire()
             return
-        # A weak handle avoids keeping the loop alive via
-        # pool -> TimerHandle -> loop, even if loop.close() skips timers.
-        idle = loop.call_later(_DEFAULT_POOL_IDLE_SECONDS, self.expire)
+        self._idle_deadline = loop.time() + _DEFAULT_POOL_IDLE_SECONDS
+        idle = self._idle_ref() if self._idle_ref is not None else None
+        if idle is None:
+            self._arm_idle_timer(_DEFAULT_POOL_IDLE_SECONDS, loop)
+
+    def _arm_idle_timer(
+        self, delay: float, loop: asyncio.AbstractEventLoop
+    ) -> None:
+        self._idle_generation += 1
+        generation = self._idle_generation
+        idle = loop.call_later(delay, self._idle_timeout, generation)
         self._idle_ref = weakref.ref(idle)
+        # EventLoop.close() discards pending timer handles without invoking
+        # callbacks. Its handle finalizer retires the otherwise stranded
+        # c-ares channel even when a caller still holds the closed loop.
+        weakref.finalize(idle, self._expire_discarded_timer, generation)
+
+    def _idle_timeout(self, generation: int) -> None:
+        if generation != self._idle_generation:
+            return
+        self._idle_ref = None
+        # Invalidate the timer finalizer: a successful callback is not a
+        # discarded handle, and another idle deadline may now be pending.
+        self._idle_generation += 1
+        if self.references or self._idle_deadline is None:
+            return
+        loop = self._loop_ref()
+        if loop is None or loop.is_closed():
+            self.expire()
+            return
+        remaining = self._idle_deadline - loop.time()
+        if remaining > 0:
+            self._arm_idle_timer(remaining, loop)
+        else:
+            self.expire()
+
+    def _expire_discarded_timer(self, generation: int) -> None:
+        if self._idle_generation == generation:
+            self.expire()
 
     def expire(self) -> None:
         if self.references:
@@ -231,9 +266,14 @@ class DNSResolver:
     @nameservers.setter
     def nameservers(self, value: Iterable[str | bytes]) -> None:
         if self._pool is not None:
-            # Copy on write: a client's runtime configuration must not
-            # silently change the DNS of other clients sharing the loop.
+            # Copy on write: configure a new channel before detaching from
+            # the shared pool. Failed updates must preserve the old channel.
             event_thread, channel = self._make_channel()
+            try:
+                channel.servers = value
+            except BaseException:
+                channel.close()
+                raise
             old_pool = self._pool
             self._event_thread, self._channel = event_thread, channel
             self._pool = None
@@ -252,6 +292,7 @@ class DNSResolver:
                     future.add_done_callback(release_after_query)
             else:
                 old_pool.release()
+            return
         self._channel.servers = value
 
     def _track_future(self, future: asyncio.Future[_T]) -> asyncio.Future[_T]:

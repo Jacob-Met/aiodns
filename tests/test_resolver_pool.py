@@ -6,6 +6,7 @@ https://github.com/aio-libs/aiodns/issues/191
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterable
 from typing import Any, ClassVar
 from unittest.mock import patch
 
@@ -221,3 +222,125 @@ def test_nameserver_copy_on_write_preserves_running_query() -> None:
     with patch('aiodns.pycares.Channel', FakeChannel):
         with patch('aiodns._DEFAULT_POOL_IDLE_SECONDS', 0.01):
             asyncio.run(run())
+
+
+def test_default_pool_disposes_timer_on_loop_close() -> None:
+    """Closing a loop also closes its idle channel, even if loop stays held."""
+
+    class FakeChannel:
+        def __init__(self, **kwargs: Any) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    with patch('aiodns.pycares.Channel', FakeChannel):
+        loop = asyncio.new_event_loop()
+        resolver = aiodns.DNSResolver(loop=loop)
+        channel = resolver._channel
+        loop.run_until_complete(resolver.close())
+        assert not channel.closed
+        loop.close()
+        assert channel.closed
+        assert aiodns._DEFAULT_POOLS.get(loop) is None
+
+
+def test_cancelled_pool_idle_timer_cannot_close_reacquired_channel() -> None:
+    """Cancellation/GC of the old idle timer cannot expire an active pool."""
+
+    class FakeChannel:
+        def __init__(self, **kwargs: Any) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    async def run() -> None:
+        resolver = aiodns.DNSResolver()
+        channel = resolver._channel
+        await resolver.close()
+        replacement = aiodns.DNSResolver()
+        assert replacement._channel is channel
+        await asyncio.sleep(0.03)
+        assert not channel.closed
+        await replacement.close()
+        await asyncio.sleep(0.03)
+        assert channel.closed
+
+    with patch('aiodns.pycares.Channel', FakeChannel):
+        with patch('aiodns._DEFAULT_POOL_IDLE_SECONDS', 0.01):
+            asyncio.run(run())
+
+
+def test_invalid_nameserver_update_preserves_shared_channel() -> None:
+    """Invalid configuration must not detach a shared pool or leak channels."""
+
+    class FakeChannel:
+        instances: ClassVar[list[FakeChannel]] = []
+
+        def __init__(self, **kwargs: Any) -> None:
+            self.closed = False
+            self._servers = ['127.0.0.1:53']
+            self.instances.append(self)
+
+        @property
+        def servers(self) -> list[str]:
+            return self._servers
+
+        @servers.setter
+        def servers(self, value: Iterable[str | bytes]) -> None:
+            entries = list(value)
+            if entries == ['invalid']:
+                raise ValueError('invalid nameservers')
+            self._servers = [str(item) for item in entries]
+
+        def close(self) -> None:
+            self.closed = True
+
+    async def run() -> None:
+        first = aiodns.DNSResolver()
+        second = aiodns.DNSResolver()
+        shared = first._channel
+        assert shared is second._channel
+        with pytest.raises(ValueError, match='invalid nameservers'):
+            first.nameservers = ['invalid']
+        assert first._channel is shared
+        assert first._pool is not None
+        assert second._channel is shared
+        assert not shared.closed
+        assert len(FakeChannel.instances) == 2
+        assert FakeChannel.instances[1].closed
+        await first.close()
+        await second.close()
+
+    with patch('aiodns.pycares.Channel', FakeChannel):
+        asyncio.run(run())
+
+
+def test_idle_timeout_extends_deadline_without_new_timer_per_client() -> None:
+    """Churn shares an armed timeout; a later release extends actual expiry."""
+
+    class FakeChannel:
+        def __init__(self, **kwargs: Any) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    with patch('aiodns.pycares.Channel', FakeChannel):
+        loop = asyncio.new_event_loop()
+        first = aiodns.DNSResolver(loop=loop)
+        channel = first._channel
+        loop.run_until_complete(first.close())
+        pool = aiodns._DEFAULT_POOLS[loop]
+        first_generation = pool._idle_generation
+        replacement = aiodns.DNSResolver(loop=loop)
+        loop.run_until_complete(replacement.close())
+        assert pool._idle_generation == first_generation
+        pool._idle_deadline = loop.time() + 1
+        pool._idle_timeout(first_generation)
+        assert pool._idle_generation > first_generation
+        assert not channel.closed
+        assert pool._idle_ref is not None
+        loop.close()
+        assert channel.closed
