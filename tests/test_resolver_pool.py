@@ -6,6 +6,7 @@ https://github.com/aio-libs/aiodns/issues/191
 from __future__ import annotations
 
 import asyncio
+import socket
 from collections.abc import Iterable
 from typing import Any, ClassVar
 from unittest.mock import patch
@@ -344,3 +345,47 @@ def test_idle_timeout_extends_deadline_without_new_timer_per_client() -> None:
         assert pool._idle_ref is not None
         loop.close()
         assert channel.closed
+
+
+@pytest.mark.parametrize('method', ['query_dns', 'query', 'gethostbyname'])
+def test_late_callback_after_loop_shutdown_is_ignored(method: str) -> None:
+    """Late worker callbacks must not schedule onto a closed loop."""
+
+    class FakeChannel:
+        def __init__(self, **kwargs: Any) -> None:
+            self.callbacks: list[Any] = []
+            self.closed = False
+
+        def query(
+            self, host: str, qtype: int, *, callback: Any, **kwargs: Any
+        ) -> None:
+            self.callbacks.append(callback)
+
+        def getaddrinfo(
+            self, *args: Any, callback: Any, **kwargs: Any
+        ) -> None:
+            self.callbacks.append(callback)
+
+        def close(self) -> None:
+            self.closed = True
+
+    with patch('aiodns.pycares.Channel', FakeChannel):
+        loop = asyncio.new_event_loop()
+        resolver = aiodns.DNSResolver(loop=loop)
+        if method == 'query_dns':
+            future = resolver.query_dns('pending.example.invalid', 'A')
+        elif method == 'query':
+            with pytest.warns(DeprecationWarning):
+                future = resolver.query('pending.example.invalid', 'A')
+        else:
+            with pytest.warns(DeprecationWarning):
+                future = resolver.gethostbyname(
+                    'pending.example.invalid', socket.AF_INET
+                )
+        callback = resolver._channel.callbacks[0]
+        loop.run_until_complete(resolver.close())
+        with pytest.raises(aiodns.error.DNSError):
+            loop.run_until_complete(future)
+        loop.close()
+        assert resolver._channel.closed
+        callback('too-late', None)

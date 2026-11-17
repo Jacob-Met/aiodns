@@ -315,6 +315,23 @@ class DNSResolver:
                     )
                 )
 
+    def _safe_call_soon_threadsafe(
+        self, callback: Callable[..., None], *args: Any
+    ) -> None:
+        # c-ares can deliver a final callback after a pooled resolver
+        # closed and the event loop was torn down. Never raise from its
+        # worker thread when the result can no longer be consumed.
+        loop = self.loop
+        if loop.is_closed():
+            return
+        try:
+            loop.call_soon_threadsafe(callback, *args)
+        except RuntimeError:
+            # Closing can race with scheduling on another thread. Preserve
+            # unrelated RuntimeErrors instead of hiding actual callback bugs.
+            if not loop.is_closed():
+                raise
+
     def _callback(
         self, fut: asyncio.Future[_T], result: _T, errorno: int | None
     ) -> None:
@@ -339,9 +356,9 @@ class DNSResolver:
             self.loop.create_future()
         )
         if self._event_thread:
-            cb = functools.partial(  # type: ignore[assignment]
-                self.loop.call_soon_threadsafe,
-                self._callback,  # type: ignore[arg-type]
+            cb = functools.partial(
+                self._safe_call_soon_threadsafe,
+                self._callback,
                 future,
             )
         else:
@@ -380,9 +397,9 @@ class DNSResolver:
         )
         cb: Callable[..., None]
         if self._event_thread:
-            cb = functools.partial(  # type: ignore[assignment]
-                self.loop.call_soon_threadsafe,
-                self._query_callback,  # type: ignore[arg-type]
+            cb = functools.partial(
+                self._safe_call_soon_threadsafe,
+                self._query_callback,
                 future,
                 qtype,
             )
@@ -554,9 +571,9 @@ class DNSResolver:
         )
         cb: Callable[..., None]
         if self._event_thread:
-            cb = functools.partial(  # type: ignore[assignment]
-                self.loop.call_soon_threadsafe,
-                self._gethostbyname_callback,  # type: ignore[arg-type]
+            cb = functools.partial(
+                self._safe_call_soon_threadsafe,
+                self._gethostbyname_callback,
                 fut,
                 host,
             )
