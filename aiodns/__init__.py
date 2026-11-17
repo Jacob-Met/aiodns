@@ -72,6 +72,68 @@ query_class_map = {
 }
 
 
+# Keep one default c-ares event-thread channel per event loop through short
+# resolver lifetimes. c-ares creates inotify instances more quickly than its
+# destructor thread can release them under heavy ClientSession churn.
+_DEFAULT_POOL_IDLE_SECONDS = 0.5
+
+
+class _DefaultChannelPool:
+    def __init__(
+        self, loop: asyncio.AbstractEventLoop, channel: pycares.Channel
+    ) -> None:
+        self.channel = channel
+        self.references = 0
+        self._loop_ref = weakref.ref(loop)
+        self._idle_ref: weakref.ReferenceType[asyncio.TimerHandle] | None = (
+            None
+        )
+        self._closed = False
+        # The pool must not keep an event loop alive after it is closed.
+        self._finalizer = weakref.finalize(loop, self._close_channel)
+
+    def acquire(self) -> None:
+        if self._idle_ref is not None:
+            idle = self._idle_ref()
+            if idle is not None:
+                idle.cancel()
+            self._idle_ref = None
+        self.references += 1
+
+    def release(self) -> None:
+        self.references -= 1
+        if self.references != 0:
+            return
+        loop = self._loop_ref()
+        if loop is None or loop.is_closed():
+            self.expire()
+            return
+        # A weak handle avoids keeping the loop alive via
+        # pool -> TimerHandle -> loop, even if loop.close() skips timers.
+        idle = loop.call_later(_DEFAULT_POOL_IDLE_SECONDS, self.expire)
+        self._idle_ref = weakref.ref(idle)
+
+    def expire(self) -> None:
+        if self.references:
+            return
+        loop = self._loop_ref()
+        if loop is not None and _DEFAULT_POOLS.get(loop) is self:
+            del _DEFAULT_POOLS[loop]
+        self._close_channel()
+
+    def _close_channel(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._finalizer.detach()
+        self.channel.close()
+
+
+_DEFAULT_POOLS: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, _DefaultChannelPool
+] = weakref.WeakKeyDictionary()
+
+
 class DNSResolver:
     def __init__(
         self,
@@ -83,10 +145,28 @@ class DNSResolver:
         self.loop = loop or asyncio.get_event_loop()
         if TYPE_CHECKING:
             assert self.loop is not None
+        # Only the unconfigured resolver is shareable. Explicit timeout,
+        # nameserver, and pycares options must retain independent channels.
+        use_default_pool = nameservers is None and not kwargs
         kwargs.pop('sock_state_cb', None)
         timeout = kwargs.pop('timeout', None)
         self._timeout = timeout
-        self._event_thread, self._channel = self._make_channel(**kwargs)
+        self._pool: _DefaultChannelPool | None = None
+        self._pending_futures: set[asyncio.Future[Any]] = set()
+        pool = _DEFAULT_POOLS.get(self.loop) if use_default_pool else None
+        if pool is not None:
+            self._event_thread, self._channel = True, pool.channel
+            self._pool = pool
+            pool.acquire()
+        else:
+            self._event_thread, self._channel = self._make_channel(**kwargs)
+            # Only event-thread channels are pooled; socket-state fallback
+            # channels have callbacks and fd watchers bound to their owner.
+            if use_default_pool and self._event_thread:
+                pool = _DefaultChannelPool(self.loop, self._channel)
+                _DEFAULT_POOLS[self.loop] = pool
+                self._pool = pool
+                pool.acquire()
         if nameservers:
             self.nameservers = nameservers
         self._read_fds: set[int] = set()
@@ -150,7 +230,49 @@ class DNSResolver:
 
     @nameservers.setter
     def nameservers(self, value: Iterable[str | bytes]) -> None:
+        if self._pool is not None:
+            # Copy on write: a client's runtime configuration must not
+            # silently change the DNS of other clients sharing the loop.
+            event_thread, channel = self._make_channel()
+            old_pool = self._pool
+            self._event_thread, self._channel = event_thread, channel
+            self._pool = None
+            pending = tuple(f for f in self._pending_futures if not f.done())
+            if pending:
+                # Preserve the old channel until already-issued queries finish.
+                remaining = len(pending)
+
+                def release_after_query(future: asyncio.Future[Any]) -> None:
+                    nonlocal remaining
+                    remaining -= 1
+                    if remaining == 0:
+                        old_pool.release()
+
+                for future in pending:
+                    future.add_done_callback(release_after_query)
+            else:
+                old_pool.release()
         self._channel.servers = value
+
+    def _track_future(self, future: asyncio.Future[_T]) -> asyncio.Future[_T]:
+        if self._closed:
+            raise RuntimeError('DNS resolver is closed')
+        if self._pool is not None:
+            self._pending_futures.add(future)
+            future.add_done_callback(self._pending_futures.discard)
+        return future
+
+    def _cancel_pending_futures(self) -> None:
+        pending = tuple(self._pending_futures)
+        self._pending_futures.clear()
+        for future in pending:
+            if not future.done():
+                future.set_exception(
+                    error.DNSError(
+                        error.ARES_ECANCELLED,
+                        pycares.errno.strerror(error.ARES_ECANCELLED),
+                    )
+                )
 
     def _callback(
         self, fut: asyncio.Future[_T], result: _T, errorno: int | None
@@ -172,7 +294,9 @@ class DNSResolver:
     ) -> tuple[asyncio.Future[_T], Callable[[_T, int | None], None]]:
         """Return a future and a callback to set the result of the future."""
         cb: Callable[[_T, int | None], None]
-        future: asyncio.Future[_T] = self.loop.create_future()
+        future: asyncio.Future[_T] = self._track_future(
+            self.loop.create_future()
+        )
         if self._event_thread:
             cb = functools.partial(  # type: ignore[assignment]
                 self.loop.call_soon_threadsafe,
@@ -210,7 +334,9 @@ class DNSResolver:
         self, qtype: int
     ) -> tuple[asyncio.Future[QueryResult], Callable[..., None]]:
         """Return a future and callback for query with result conversion."""
-        future: asyncio.Future[QueryResult] = self.loop.create_future()
+        future: asyncio.Future[QueryResult] = self._track_future(
+            self.loop.create_future()
+        )
         cb: Callable[..., None]
         if self._event_thread:
             cb = functools.partial(  # type: ignore[assignment]
@@ -382,7 +508,9 @@ class DNSResolver:
             DeprecationWarning,
             stacklevel=2,
         )
-        fut: asyncio.Future[AresHostResult] = self.loop.create_future()
+        fut: asyncio.Future[AresHostResult] = self._track_future(
+            self.loop.create_future()
+        )
         cb: Callable[..., None]
         if self._event_thread:
             cb = functools.partial(  # type: ignore[assignment]
@@ -439,7 +567,10 @@ class DNSResolver:
         return fut
 
     def cancel(self) -> None:
-        self._channel.cancel()
+        if self._pool is None:
+            self._channel.cancel()
+        # A shared channel's cancel() would also cancel unrelated clients.
+        self._cancel_pending_futures()
 
     def _sock_state_cb(self, fd: int, readable: bool, writable: bool) -> None:
         if readable or writable:
@@ -497,6 +628,11 @@ class DNSResolver:
             return
         # Mark as closed first to prevent double cleanup
         self._closed = True
+        self._cancel_pending_futures()
+        if self._pool is not None:
+            self._pool.release()
+            self._pool = None
+            return
         # Cancel timer if running
         if self._timer is not None:
             self._timer.cancel()
@@ -519,7 +655,7 @@ class DNSResolver:
         This should be called to ensure all resources are properly released.
         After calling close(), the resolver should not be used again.
         """
-        if not self._closed:
+        if not self._closed and self._pool is None:
             self._channel.cancel()
         self._cleanup()
 

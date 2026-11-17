@@ -587,8 +587,11 @@ def test_del_with_stopped_event_loop() -> None:
 
 
 @pytest.mark.asyncio
-async def test_del_with_running_event_loop() -> None:
-    """Test __del__ when event loop is running performs cleanup."""
+async def test_del_with_running_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Default resolvers release their pooled channel after the idle grace."""
+    monkeypatch.setattr(aiodns, '_DEFAULT_POOL_IDLE_SECONDS', 0.01)
     resolver = aiodns.DNSResolver()
 
     # Mark that cleanup was called by checking if channel.close was called
@@ -606,14 +609,17 @@ async def test_del_with_running_event_loop() -> None:
     del resolver
     gc.collect()
 
-    # Verify cleanup was called
+    # A pooled physical channel survives immediate logical cleanup to
+    # amortize short-lived clients, then is closed after the idle grace.
+    assert not cleanup_called
+    await asyncio.sleep(0.03)
     assert cleanup_called
 
 
 @pytest.mark.asyncio
 async def test_cleanup_method() -> None:
-    """Test that _cleanup() properly cleans up resources."""
-    resolver = aiodns.DNSResolver()
+    """Test that _cleanup() properly cleans up a private channel."""
+    resolver = aiodns.DNSResolver(timeout=5.0)
 
     # Mock file descriptors and timer
     resolver._read_fds.add(1)

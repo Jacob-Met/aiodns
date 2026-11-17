@@ -52,9 +52,13 @@ The API is pretty simple, the following functions are provided in the ``DNSResol
 * ``getnameinfo(sockaddr, flags)``: Resolve a socket address to a host and port.
 * ``cancel()``: Cancel all pending DNS queries. All futures will get ``DNSError`` exception set, with
   ``ARES_ECANCELLED`` errno.
-* ``close()``: Close the resolver. This releases all resources and cancels any pending queries. It must be called
-  when the resolver is no longer needed (e.g., application shutdown). The resolver should only be closed from the
-  event loop that created the resolver.
+* ``close()``: Close the resolver and cancel its pending queries. It must be called when the
+  resolver is no longer needed (e.g., application shutdown) from the event loop that created it.
+  Default-configured resolvers on the same loop share an underlying c-ares event-thread channel;
+  closing one cannot cancel another's queries. The shared channel is kept for a brief idle grace
+  (0.5 seconds) to avoid repeated inotify initialization, then released. Custom-configured
+  resolvers retain dedicated channels and release them immediately. Reusing a long-lived resolver
+  remains the recommended approach.
 
 
 Migrating from aiodns 3.x
